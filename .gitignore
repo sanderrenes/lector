@@ -19,3 +19,8 @@ keystore.properties
 
 # OS
 .DS_Store
+
+# tmp docs
+lector-pdf-cleaning-pipeline.md
+.claude
+
