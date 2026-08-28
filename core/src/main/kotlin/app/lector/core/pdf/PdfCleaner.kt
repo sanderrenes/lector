@@ -60,6 +60,21 @@ data class PdfCleanerConfig(
     val columnSpanRatio: Float = 0.75f,
     /** Lines needed on EACH side before a page is treated as two columns. */
     val minColumnLines: Int = 4,
+    /**
+     * A run set no larger than this fraction of the rest of its line's font size
+     * is treated as an inline footnote/reference marker and dropped. A real
+     * inline number ("In 1948…") is set at body size; only a superscript marker
+     * reads this much smaller.
+     */
+    val footnoteMarkerSizeRatio: Float = 0.75f,
+    /** Drop trailing footnote-marker runs from the spoken text. */
+    val dropFootnoteMarkers: Boolean = true,
+    /** A page's trailing lines at or below this fraction of body font size are footnotes. */
+    val footnoteBlockSizeRatio: Float = 0.85f,
+    /** Smaller-font trailing lines needed before a page's foot counts as a footnote block. */
+    val minFootnoteLines: Int = 1,
+    /** Drop the footnote block pinned to the foot of the page. */
+    val dropFootnoteBlocks: Boolean = true,
 )
 
 /**
@@ -147,7 +162,12 @@ class PdfCleaner(private val config: PdfCleanerConfig = PdfCleanerConfig()) {
             val built = buildLines(pageRuns, gutter)
             if (gutter == null) built else reorderColumns(built, gutter)
         } // Stage 0 (+ 0.5)
-        val body = bodyMetrics(stripRunningFurniture(lines, pages.size)) // Stage 1
+        // A rough body size from the whole document, before anything is stripped,
+        // is a stable enough reference for spotting footnotes by size — they are
+        // a minority of the page and don't move the median.
+        val roughFontSize = bodyMetrics(lines).fontSize
+        val withoutFootnotes = if (config.dropFootnoteBlocks) stripFootnoteBlocks(lines, roughFontSize) else lines
+        val body = bodyMetrics(stripRunningFurniture(withoutFootnotes, pages.size)) // Stage 1
         val regions = if (config.dropFigureInternals) findFigureRegions(body) else emptyList()
         return Prepared(this, body, regions)
     }
@@ -343,6 +363,7 @@ class PdfCleaner(private val config: PdfCleanerConfig = PdfCleanerConfig()) {
         }
         return clusters.map { cluster ->
             val ordered = cluster.sortedBy { it.xStart }
+                .let { if (config.dropFootnoteMarkers) dropFootnoteMarkers(it) else it }
             PdfLine(
                 page = ordered.first().page,
                 pageHeight = ordered.first().pageHeight,
@@ -355,6 +376,25 @@ class PdfCleaner(private val config: PdfCleanerConfig = PdfCleanerConfig()) {
                 runs = ordered,
             )
         }.filter { it.text.isNotBlank() }
+    }
+
+    /**
+     * Drop an inline footnote/reference marker riding within a line: bare digits
+     * or a conventional footnote symbol, set in a face meaningfully smaller than
+     * the rest of the line. A real inline number ("In 1948…") is set at body
+     * size, same as everything around it, so it survives; only a superscript
+     * marker is small enough to trip [PdfCleanerConfig.footnoteMarkerSizeRatio],
+     * and a lone line that is nothing but a small number (a stray page number
+     * that slipped past Stage 1, say) survives too, since it has nothing larger
+     * on its own line to be smaller than.
+     */
+    internal fun dropFootnoteMarkers(ordered: List<PdfRun>): List<PdfRun> {
+        if (ordered.size < 2) return ordered
+        val maxSize = ordered.maxOf { it.fontSize }
+        val kept = ordered.filterNot { run ->
+            run.fontSize <= maxSize * config.footnoteMarkerSizeRatio && FOOTNOTE_MARKER.matches(run.text.trim())
+        }
+        return kept.ifEmpty { ordered }
     }
 
     /**
@@ -452,6 +492,35 @@ class PdfCleaner(private val config: PdfCleanerConfig = PdfCleanerConfig()) {
             sb.append(piece)
         }
         return sb.toString().trim()
+    }
+
+    // -- Stage 0.9 - footnote block removal -------------------------------------
+
+    /**
+     * Drop a page's footnote block: a run of lines at the foot of the page set
+     * in a face meaningfully smaller than body text. A footnote is laid out
+     * exactly like this — smaller type, pinned to the bottom — and it is
+     * reference material a listener has no way to act on mid-sentence, cut
+     * loose from whatever marker pointed to it the moment
+     * [dropFootnoteMarkers] removes that marker from the flow above.
+     *
+     * The scan starts at the last line of the page and works upward, passing
+     * straight through the footer margin band itself (a page number lives
+     * there and is Stage 1's job) so a same-size page number sitting below the
+     * footnotes doesn't stop the small-font run from ever being found.
+     */
+    internal fun stripFootnoteBlocks(lines: List<PdfLine>, bodyFontSize: Float): List<PdfLine> {
+        if (lines.isEmpty() || bodyFontSize <= 0f) return lines
+        val threshold = bodyFontSize * config.footnoteBlockSizeRatio
+        return lines.groupBy { it.page }.toSortedMap().flatMap { (_, pageLines) ->
+            var cut = pageLines.size
+            while (cut > 0) {
+                val line = pageLines[cut - 1]
+                if (inMargin(line) || line.fontSize <= threshold) cut-- else break
+            }
+            val footnoteLines = (cut until pageLines.size).count { pageLines[it].fontSize <= threshold }
+            if (footnoteLines >= config.minFootnoteLines) pageLines.subList(0, cut) else pageLines
+        }
     }
 
     // -- Stage 1 - header / footer / page-number removal -----------------------
@@ -813,14 +882,18 @@ class PdfCleaner(private val config: PdfCleanerConfig = PdfCleanerConfig()) {
     internal fun isSoftWrap(line: PdfLine, next: PdfLine, bodyLeft: Float?, body: BodyMetrics): Boolean {
         // (1) no sentence-terminal punctuation, ignoring trailing quotes/brackets.
         if (SENTENCE_END.containsMatchIn(line.text)) return false
-        // (2) the next line sits on the paragraph's margin. Before that margin exists,
+        // (2) across a page break, a paragraph legitimately continues even though
+        // its column resets: on a two-column layout the page ends in the right
+        // column and the next one picks up in the left, so comparing next's x
+        // against a margin established on the OLD page's (different) column would
+        // reject every such continuation. There is no gap to measure either. Only
+        // the sentence-end test above gates the merge here.
+        if (next.page != line.page) return true
+        // (3) the next line sits on the paragraph's margin. Before that margin exists,
         // allow the wider swing of a first-line indent or a hanging indent either way.
         val allowed = if (bodyLeft == null) config.firstLineIndentEm else config.indentToleranceEm
         if (abs(next.xStart - (bodyLeft ?: line.xStart)) > body.em * allowed) return false
-        // (3) a single line-height step down. Across a page break there is no gap to
-        // measure — a paragraph legitimately continues onto the next page, so the
-        // other conditions decide there.
-        if (next.page != line.page) return true
+        // (4) a single line-height step down.
         if (next.y <= line.y) return false // a new column, not the next line
         return next.y - line.y <= body.lineHeight * config.lineGapFactor
     }
@@ -849,6 +922,10 @@ class PdfCleaner(private val config: PdfCleanerConfig = PdfCleanerConfig()) {
 
     private companion object {
         val WHITESPACE = Regex("""\s+""")
+
+        /** A footnote/citation reference marker on its own: bare digits, or a
+         * conventional footnote symbol (possibly doubled, e.g. "**"). */
+        val FOOTNOTE_MARKER = Regex("""[0-9]{1,3}|[*†‡§¶]+""")
 
         /**
          * Sentence-terminal punctuation at end of line, allowing trailing closing

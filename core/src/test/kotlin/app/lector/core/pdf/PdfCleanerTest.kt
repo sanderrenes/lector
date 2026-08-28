@@ -627,6 +627,27 @@ class PdfCleanerTest {
     // -- Stage 2/3 heading guard --------------------------------------------------
 
     @Test
+    fun `a paragraph flowing from one page's right column into the next page's left column is not split`() {
+        // Page 1 ends in the right column, mid-sentence (no terminal punctuation).
+        // Page 2 picks the sentence back up in the LEFT column — the only valid
+        // transition in a two-column layout, since each page restarts left-to-right.
+        // Left/right use different line heights (as in twoColumnProse) so the two
+        // columns don't share a y-band and merge into one line before Stage 0.5
+        // ever gets a chance to keep them apart — matching twoColumnProse's own
+        // row count, since the first couple of rows still coincide before the
+        // drift adds up to more than the y-band tolerance.
+        val rows = 8
+        val page1 = (0 until rows).map { i -> run(1, 100f + i * 12f, 72f, "L${i + 1}.", width = 90f) } +
+            (0 until rows - 1).map { i -> run(1, 100f + i * 14f, 250f, "R${i + 1}.", width = 90f) } +
+            listOf(run(1, 100f + (rows - 1) * 14f, 250f, "and then it", width = 90f)) // no terminal punctuation
+        val page2 = listOf(run(2, 100f, 72f, "picks up here.", width = 90f)) + // continuation, left column
+            (1 until rows).map { i -> run(2, 100f + i * 12f, 72f, "L${rows + 1 + i}.", width = 90f) } +
+            (0 until rows).map { i -> run(2, 100f + i * 14f, 250f, "R${rows + 1 + i}.", width = 90f) }
+        val texts = cleaner.clean(page1 + page2).map { it.text }
+        assertTrue("and then it picks up here." in texts)
+    }
+
+    @Test
     fun `a lone superscript affiliation marker does not strand itself as a heading`() {
         // The marker is raised above the affiliation text it labels, so it lands
         // on its own line, one line above — and in a smaller face, which would
@@ -640,5 +661,64 @@ class PdfCleanerTest {
         )
         val text = cleaner.cleanToText(runs)
         assertEquals("a Department of Engineering, Example University.", text)
+    }
+
+    // -- Stage 0.9 - footnotes ---------------------------------------------------
+
+    @Test
+    fun `an inline footnote marker is dropped from the spoken text`() {
+        val runs = listOf(
+            run(1, 400f, 72f, "The effect", width = 60f),
+            run(1, 400f, 132f, "1", size = 6f, width = 5f), // superscript: smaller face
+            run(1, 400f, 137f, "was significant.", width = 110f),
+        )
+        assertEquals("The effect was significant.", cleaner.cleanToText(runs))
+    }
+
+    @Test
+    fun `a normal-size number split into its own run is not mistaken for a footnote marker`() {
+        // Same font size as the rest of the line — an ordinary number, not a
+        // superscript, even though it happens to land in its own run.
+        val runs = listOf(
+            run(1, 400f, 72f, "In", width = 20f),
+            run(1, 400f, 95f, "1948", width = 30f),
+            run(1, 400f, 128f, "the study began.", width = 130f),
+        )
+        assertEquals("In 1948 the study began.", cleaner.cleanToText(runs))
+    }
+
+    @Test
+    fun `a footnote block at the foot of the page is dropped`() {
+        val body = (0 until 5).map { i -> run(1, 200f + i * 20f, 72f, "Body sentence $i continues here.", width = 300f) }
+        val footnotes = listOf(
+            run(1, 600f, 72f, "1 See Smith 2020 for the full derivation.", size = 7f, width = 300f),
+            run(1, 612f, 72f, "2 The dataset excludes weekends.", size = 7f, width = 300f),
+        )
+        val text = cleaner.cleanToText(body + footnotes)
+
+        assertTrue(text.contains("Body sentence 0 continues here."))
+        assertTrue(text.contains("Body sentence 4 continues here."))
+        assertFalse(text.contains("Smith"))
+        assertFalse(text.contains("weekends"))
+    }
+
+    @Test
+    fun `a same-size page number below the footnotes does not block finding them`() {
+        val body = (0 until 5).map { i -> run(1, 200f + i * 20f, 72f, "Body sentence $i continues here.", width = 300f) }
+        val footnote = run(1, 600f, 72f, "1 See Smith 2020 for the full derivation.", size = 7f, width = 300f)
+        val pageNumber = run(1, 760f, 300f, "7", width = 10f) // normal size, sits in the footer margin band
+        val text = cleaner.cleanToText(body + listOf(footnote, pageNumber))
+
+        assertTrue(text.contains("Body sentence 0 continues here."))
+        assertFalse(text.contains("Smith"))
+    }
+
+    @Test
+    fun `footnote handling can be turned off`() {
+        val cleaner = PdfCleaner(PdfCleanerConfig(dropFootnoteMarkers = false, dropFootnoteBlocks = false))
+        val body = (0 until 5).map { i -> run(1, 200f + i * 20f, 72f, "Body sentence $i continues here.", width = 300f) }
+        val footnote = run(1, 600f, 72f, "1 See Smith 2020 for the full derivation.", size = 7f, width = 300f)
+        val text = cleaner.cleanToText(body + listOf(footnote))
+        assertTrue(text.contains("Smith"))
     }
 }
