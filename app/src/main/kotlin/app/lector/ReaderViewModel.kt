@@ -1,16 +1,25 @@
 package app.lector
 
 import android.app.Application
+import android.content.ComponentName
+import android.content.Context
+import android.content.Intent
+import android.content.ServiceConnection
 import android.net.Uri
+import android.os.IBinder
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.viewModelScope
 import app.lector.core.Document
+import app.lector.core.PlaybackClock
 import app.lector.core.Segmenter
 import app.lector.data.LibraryEntry
 import app.lector.data.LibraryStore
 import app.lector.io.DocumentImporter
 import app.lector.io.ImportResult
+import app.lector.playback.PlaybackCommand
+import app.lector.playback.PlaybackService
 import app.lector.speech.EngineStatus
 import app.lector.speech.SpeechEngine
 import app.lector.speech.SpeechPosition
@@ -20,6 +29,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -68,7 +79,50 @@ class ReaderViewModel(
     private var lastSavedSentence = 0
     private var sleepJob: kotlinx.coroutines.Job? = null
 
+    // ── Media session (watch/lock-screen/Bluetooth transport controls) ─────────
+    // Bound for the ViewModel's whole lifetime so PlaybackService.commands can be
+    // collected as soon as it connects; the service itself isn't marked "started"
+    // (and so doesn't go foreground or outlive an unbind) until playback actually
+    // begins — see setPlaying().
+    private var playbackService: PlaybackService? = null
+    private val serviceConnection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
+            val service = (binder as? PlaybackService.LocalBinder)?.service ?: return
+            playbackService = service
+            viewModelScope.launch {
+                service.commands.collect { command ->
+                    when (command) {
+                        is PlaybackCommand.SetPlaying -> setPlaying(command.playing)
+                        is PlaybackCommand.Skip -> skipSeconds(command.seconds)
+                    }
+                }
+            }
+            pushNowPlaying(_uiState.value)
+        }
+
+        override fun onServiceDisconnected(name: ComponentName?) {
+            playbackService = null
+        }
+    }
+
     init {
+        getApplication<Application>().bindService(
+            Intent(getApplication(), PlaybackService::class.java),
+            serviceConnection,
+            Context.BIND_AUTO_CREATE,
+        )
+        viewModelScope.launch {
+            // Position/word-highlight updates fire many times a second while
+            // speaking; only a change to what the session actually shows should
+            // touch it (each push re-issues startForeground(), not something to
+            // do on every word boundary).
+            _uiState
+                .map { Triple(it.title, it.isPlaying, it.document != null) }
+                .distinctUntilChanged()
+                .collect { (title, isPlaying, hasDoc) ->
+                    playbackService?.updateNowPlaying(title, isPlaying, canSkip = hasDoc)
+                }
+        }
         viewModelScope.launch {
             engine.status.collect { s -> _uiState.update { it.copy(engineStatus = s) } }
         }
@@ -183,14 +237,31 @@ class ReaderViewModel(
 
     fun selectVoice(id: String?) = engine.selectVoice(id)
 
-    fun playPause() {
+    fun playPause() = setPlaying(!_uiState.value.isPlaying)
+
+    /**
+     * Idempotent play/pause, shared by the on-screen button and the media-session
+     * callback: a hardware onPlay() arriving while already playing (some Bluetooth
+     * remotes send it redundantly) is a no-op rather than a toggle that would
+     * pause instead.
+     */
+    private fun setPlaying(playing: Boolean) {
         val state = _uiState.value
-        val doc = state.document ?: return
-        if (state.isPlaying) {
+        if (playing == state.isPlaying) return
+        if (playing) {
+            val doc = state.document ?: return
+            // Marks the service "started" so it (and the media session/notification
+            // it hosts) survives even if the app's task is later removed while this
+            // keeps playing — see PlaybackService's class doc. Must happen right
+            // before the service's own startForeground() call (from the state
+            // collector's pushNowPlaying, triggered by engine.speaking below) to
+            // stay inside Android's post-startForegroundService window.
+            val app = getApplication<Application>()
+            ContextCompat.startForegroundService(app, Intent(app, PlaybackService::class.java))
+            engine.speak(doc, state.currentSentence, state.speed)
+        } else {
             engine.stop()
             persistResumeNow(state.currentSentence)
-        } else {
-            engine.speak(doc, state.currentSentence, state.speed)
         }
     }
 
@@ -206,6 +277,18 @@ class ReaderViewModel(
     }
 
     fun skip(delta: Int) = seekTo(_uiState.value.currentSentence + delta)
+
+    /**
+     * Skip forward/backward by an estimated amount of listening time (negative =
+     * backward) — what a media control's rewind/fast-forward or previous/next
+     * button sends. See [PlaybackClock] for how "30 seconds" becomes a sentence.
+     */
+    fun skipSeconds(seconds: Float) {
+        val state = _uiState.value
+        val doc = state.document ?: return
+        if (doc.isEmpty) return
+        seekTo(PlaybackClock.skip(doc.sentences, state.currentSentence, seconds, state.speed))
+    }
 
     fun setSpeed(speed: Float) {
         val state = _uiState.value
@@ -240,10 +323,19 @@ class ReaderViewModel(
         library.saveResume(uri, sentence, flush) // per-key, synchronous — no coroutine needed
     }
 
+    // ── Media session mirroring ─────────────────────────────────────────────────
+
+    /** Keep the media session's transport state in sync with what's actually
+     * happening, so a lock screen/watch control never shows a stale play button. */
+    private fun pushNowPlaying(state: ReaderUiState) {
+        playbackService?.updateNowPlaying(state.title, state.isPlaying, canSkip = state.document != null)
+    }
+
     override fun onCleared() {
         // flush=true (commit) because viewModelScope is already cancelled here (F3).
         persistResumeNow(_uiState.value.currentSentence, flush = true)
         engine.shutdown()
+        runCatching { getApplication<Application>().unbindService(serviceConnection) }
     }
 
     private companion object {

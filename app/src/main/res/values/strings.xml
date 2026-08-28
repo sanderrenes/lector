@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Lector</string>
+    <string name="playback_notification_channel">Playback</string>
+    <string name="playback_notification_text">Reading aloud</string>
+</resources>

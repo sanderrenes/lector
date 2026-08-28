@@ -78,6 +78,7 @@ dependencies {
 
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.androidx.core.ktx)
+    implementation(libs.androidx.media) // MediaSessionCompat for system/watch transport controls
     implementation(libs.androidx.documentfile)
     implementation(libs.pdfbox.android) // PDF text extraction (Apache-2.0, FOSS-clean)
     implementation(libs.androidx.lifecycle.runtime.ktx)
