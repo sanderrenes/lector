@@ -53,6 +53,13 @@ data class PdfCleanerConfig(
     val minInkPrimitives: Int = 16,
     /** Vertical slack when matching ink against a candidate's span, in em. */
     val figureInkPadEm: Float = 2f,
+    /**
+     * A line at least this fraction of the page's content width counts as
+     * spanning both columns rather than sitting in one of them.
+     */
+    val columnSpanRatio: Float = 0.75f,
+    /** Lines needed on EACH side before a page is treated as two columns. */
+    val minColumnLines: Int = 4,
 )
 
 /**
@@ -131,7 +138,15 @@ class PdfCleaner(private val config: PdfCleanerConfig = PdfCleanerConfig()) {
         if (runs.isEmpty()) return Prepared(this, BodyMetrics(emptyList(), 12f, 14f, 400f), emptyList())
 
         val pages = runs.groupBy { it.page }.toSortedMap()
-        val lines = pages.values.flatMap(::buildLines) // Stage 0
+        val lines = pages.values.flatMap { pageRuns ->
+            // Two passes: the first finds out whether this page has a persistent
+            // column gutter at all (Stage 0 with no gutter knowledge yet), the second
+            // re-clusters knowing where it is, so two lines that only share a y-band
+            // by coincidence — the top row of each column — don't fuse into one.
+            val gutter = columnGutter(buildLines(pageRuns))
+            val built = buildLines(pageRuns, gutter)
+            if (gutter == null) built else reorderColumns(built, gutter)
+        } // Stage 0 (+ 0.5)
         val body = bodyMetrics(stripRunningFurniture(lines, pages.size)) // Stage 1
         val regions = if (config.dropFigureInternals) findFigureRegions(body) else emptyList()
         return Prepared(this, body, regions)
@@ -302,8 +317,18 @@ class PdfCleaner(private val config: PdfCleanerConfig = PdfCleanerConfig()) {
 
     // -- Stage 0 - structured extraction --------------------------------------
 
-    /** Cluster one page's runs into visual lines by y-band, then order them. */
-    internal fun buildLines(pageRuns: List<PdfRun>): List<PdfLine> {
+    /**
+     * Cluster one page's runs into visual lines by y-band, then order them.
+     *
+     * [gutterX], when known, keeps a y-band cluster from spanning it: two runs
+     * that land in the same band purely by coincidence — the top line of a left
+     * column and the top line of a right one, or two side-by-side tables whose
+     * rows share a leading grid — would otherwise be joined into one [PdfLine]
+     * by [joinRuns] before either column even exists as a separate object, which
+     * [reorderColumns] downstream is too late to undo. A run that itself crosses
+     * [gutterX] (a heading, a full-width table cell) is never split against.
+     */
+    internal fun buildLines(pageRuns: List<PdfRun>, gutterX: Float? = null): List<PdfLine> {
         if (pageRuns.isEmpty()) return emptyList()
         val tolerance = (median(pageRuns.map { it.height }) * config.lineBandFactor)
             .coerceAtLeast(0.5f)
@@ -312,7 +337,8 @@ class PdfCleaner(private val config: PdfCleanerConfig = PdfCleanerConfig()) {
         val clusters = mutableListOf<MutableList<PdfRun>>()
         for (run in sorted) {
             val open = clusters.lastOrNull()
-            if (open != null && run.y - open.first().y <= tolerance) open += run
+            val sameBand = open != null && run.y - open.first().y <= tolerance
+            if (sameBand && (gutterX == null || !straddlesGutter(open!!, run, gutterX))) open!! += run
             else clusters += mutableListOf(run)
         }
         return clusters.map { cluster ->
@@ -329,6 +355,91 @@ class PdfCleaner(private val config: PdfCleanerConfig = PdfCleanerConfig()) {
                 runs = ordered,
             )
         }.filter { it.text.isNotBlank() }
+    }
+
+    /**
+     * True when the open cluster and the candidate run sit on strictly opposite
+     * sides of [gutterX], with nothing on either side actually crossing it —
+     * i.e. merging them would splice two different columns' lines into one.
+     * A row that legitimately spans the gutter (a run straddling it, in the
+     * cluster or the candidate) is left alone; that is ordinary single-column
+     * content, or a table cell wider than one column, not two columns.
+     */
+    private fun straddlesGutter(open: List<PdfRun>, run: PdfRun, gutterX: Float): Boolean {
+        if (run.xStart < gutterX && run.xEnd > gutterX) return false
+        if (open.any { it.xStart < gutterX && it.xEnd > gutterX }) return false
+        val openOnLeft = open.any { it.xEnd <= gutterX }
+        val openOnRight = open.any { it.xStart >= gutterX }
+        val runOnRight = run.xStart >= gutterX
+        val runOnLeft = run.xEnd <= gutterX
+        return (openOnLeft && runOnRight) || (openOnRight && runOnLeft)
+    }
+
+    /**
+     * The page's column gutter, or null without persistent evidence of one:
+     * at least [PdfCleanerConfig.minColumnLines] lines sitting entirely left of
+     * the content's horizontal midpoint, and as many entirely right of it,
+     * neither wide enough to count as spanning both sides.
+     */
+    private fun columnGutter(lines: List<PdfLine>): Float? {
+        if (lines.size < config.minColumnLines * 2) return null
+        val minX = lines.minOf { it.xStart }
+        val maxX = lines.maxOf { it.xEnd }
+        val contentWidth = maxX - minX
+        if (contentWidth <= 0f) return null
+        val midX = minX + contentWidth / 2f
+        val spanWidth = contentWidth * config.columnSpanRatio
+        val left = lines.count { it.width < spanWidth && it.xEnd <= midX }
+        val right = lines.count { it.width < spanWidth && it.xStart >= midX }
+        return if (left >= config.minColumnLines && right >= config.minColumnLines) midX else null
+    }
+
+    /**
+     * Stage 0.5 — put a two-column page's lines in reading order.
+     *
+     * Stage 0 sorts purely by y then x, which is correct for a single column but
+     * reads across the gutter on a two-column page: the top line of the right
+     * column shares its y-band with the top line of the left one, so it comes
+     * right after it, splicing two unrelated lines of prose (or two side-by-side
+     * tables) into one. A reader never does this — the whole left column is read
+     * top to bottom, then the whole right one.
+     *
+     * A line spanning most of the content width (a heading, a caption, a table or
+     * figure laid across both columns) cannot belong to either column and acts as
+     * a hard break: whatever is pending on each side flushes — left column first,
+     * then right — the spanning line is emitted, and accumulation starts fresh
+     * beneath it.
+     */
+    internal fun reorderColumns(lines: List<PdfLine>, gutterX: Float): List<PdfLine> {
+        val minX = lines.minOf { it.xStart }
+        val maxX = lines.maxOf { it.xEnd }
+        val spanWidth = (maxX - minX) * config.columnSpanRatio
+
+        // -1 = left column, +1 = right column, 0 = spans both (or straddles the
+        // gutter without being wide enough to call spanning — safest read the same).
+        fun side(line: PdfLine): Int = when {
+            line.width >= spanWidth -> 0
+            line.xEnd <= gutterX -> -1
+            line.xStart >= gutterX -> 1
+            else -> 0
+        }
+
+        val result = ArrayList<PdfLine>(lines.size)
+        val pendingLeft = mutableListOf<PdfLine>()
+        val pendingRight = mutableListOf<PdfLine>()
+        fun flush() {
+            result += pendingLeft; pendingLeft.clear()
+            result += pendingRight; pendingRight.clear()
+        }
+        for (line in lines) {
+            when (side(line)) {
+                -1 -> pendingLeft += line
+                1 -> pendingRight += line
+                else -> { flush(); result += line }
+            }
+        }
+        flush()
+        return result
     }
 
     /** Concatenate runs, inserting a space wherever the glyphs left one. */
@@ -441,6 +552,13 @@ class PdfCleaner(private val config: PdfCleanerConfig = PdfCleanerConfig()) {
     internal fun isHeading(line: PdfLine, body: BodyMetrics): Boolean {
         val short = line.width <= body.width * config.headingWidthRatio
         if (!short) return false
+        // A lone superscript affiliation marker ("a", "b", "1") is short and often
+        // sits in a smaller face than body text, which would otherwise satisfy the
+        // size-deviation heading test below and strand it as its own one-character
+        // utterance instead of leaving it to flow with the affiliation line it
+        // marks. A real heading, numbered or all-caps, is never this short.
+        val letters = line.text.filter { it.isLetter() }
+        if (letters.length < 3) return false
         val sizeRatio = line.fontSize / body.fontSize
         if (sizeRatio >= config.headingSizeRatio || sizeRatio <= 1f / config.headingSizeRatio) return true
         // A numbered section heading. Academic templates set the deeper levels barely
@@ -449,8 +567,7 @@ class PdfCleaner(private val config: PdfCleanerConfig = PdfCleanerConfig()) {
         // A wrapped list item can open the same way, which is why "short" comes first.
         if (NUMBERED_HEADING.containsMatchIn(line.text) && !SENTENCE_END.containsMatchIn(line.text)) return true
         // Style deviation we can see without font names: a short ALL-CAPS line.
-        val letters = line.text.filter { it.isLetter() }
-        return letters.length >= 3 && letters.all { it.isUpperCase() }
+        return letters.all { it.isUpperCase() }
     }
 
     /**

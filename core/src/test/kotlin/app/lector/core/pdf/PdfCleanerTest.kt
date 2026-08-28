@@ -537,4 +537,108 @@ class PdfCleanerTest {
         val runs = (1..5).map { page -> run(page, 30f, 72f, "Running Head") }
         assertTrue(cleaner.clean(runs).isEmpty())
     }
+
+    // -- Stage 0.5 - column reading order ---------------------------------------
+
+    /**
+     * Ten rows of two-column prose. The columns are given different line heights
+     * (12pt vs 14pt) so their y-grids drift apart after the first couple of rows —
+     * a real two-column page rarely keeps both columns' baselines in lockstep for
+     * long, since paragraphs break at different points in each. That drift is what
+     * lets column detection bootstrap itself before a single line has been split:
+     * most rows are already unambiguous separate lines even under plain y-then-x
+     * clustering, and only the first row or two land in the same y-band by luck.
+     */
+    private fun twoColumnProse(rows: Int = 10): List<PdfRun> =
+        (0 until rows).map { i -> run(1, 100f + i * 12f, 72f, "Left sentence ${i + 1}.", width = 90f) } +
+            (0 until rows).map { i -> run(1, 100f + i * 14f, 250f, "Right sentence ${i + 1}.", width = 90f) }
+
+    @Test
+    fun `two columns of prose are read column by column, not across the gutter`() {
+        val segments = cleaner.clean(twoColumnProse())
+        val texts = segments.map { it.text }
+        assertEquals((1..10).map { "Left sentence $it." }, texts.filter { it.startsWith("Left") })
+        assertEquals((1..10).map { "Right sentence $it." }, texts.filter { it.startsWith("Right") })
+        // Every left line precedes every right line — the columns don't interleave.
+        assertTrue(texts.indexOfLast { it.startsWith("Left") } < texts.indexOfFirst { it.startsWith("Right") })
+    }
+
+    @Test
+    fun `a heading spanning both columns flushes what came before it and starts fresh beneath`() {
+        val heading = run(1, 250f, 72f, "RESULTS", size = 10f, width = 268f) // full content width
+        val runs = twoColumnProse(rows = 5) + listOf(heading) +
+            (0 until 5).map { i -> run(1, 280f + i * 12f, 72f, "After-left ${i + 1}.", width = 90f) } +
+            (0 until 5).map { i -> run(1, 280f + i * 14f, 250f, "After-right ${i + 1}.", width = 90f) }
+        val texts = cleaner.clean(runs).map { it.text }
+
+        val heads = texts.indexOf("RESULTS")
+        assertTrue(heads > 0)
+        // Everything before the heading is old-column content, everything after is new.
+        assertTrue(texts.subList(0, heads).all { it.startsWith("Left") || it.startsWith("Right") })
+        assertTrue(texts.subList(heads + 1, texts.size).all { it.startsWith("After") })
+        assertTrue(texts.indexOfLast { it.startsWith("After-left") } < texts.indexOfFirst { it.startsWith("After-right") })
+    }
+
+    @Test
+    fun `two tables side by side stay two tables instead of fusing their rows`() {
+        // Bootstrap the gutter from ordinary prose above the tables, the way a real
+        // page would: the tables' own rows share an identical leading grid left to
+        // right, which alone gives Stage 0 nothing to detect a column split from.
+        val prose = twoColumnProse()
+        val leftTable = listOf(
+            run(1, 300f, 72f, "Region", width = 40f),
+            run(1, 300f, 130f, "Units", width = 35f),
+            run(1, 312f, 72f, "North", width = 35f),
+            run(1, 312f, 130f, "120", width = 20f),
+            run(1, 324f, 72f, "South", width = 35f),
+            run(1, 324f, 130f, "95", width = 15f),
+        )
+        val rightTable = listOf(
+            run(1, 300f, 250f, "Country", width = 45f),
+            run(1, 300f, 310f, "Score", width = 35f),
+            run(1, 312f, 250f, "UK", width = 20f),
+            run(1, 312f, 310f, "88", width = 15f),
+            run(1, 324f, 250f, "NL", width = 20f),
+            run(1, 324f, 310f, "91", width = 15f),
+        )
+        val texts = cleaner.clean(prose + leftTable + rightTable).map { it.text }
+
+        assertTrue("Row 1: Region is North, Units is 120." in texts)
+        assertTrue("Row 2: Region is South, Units is 95." in texts)
+        assertTrue("Row 1: Country is UK, Score is 88." in texts)
+        assertTrue("Row 2: Country is NL, Score is 91." in texts)
+        // Neither table's rows fused with the other's into one wide row.
+        assertFalse(texts.any { "Region" in it && "Country" in it })
+        // The left table reads out before the right one, same as the prose above it.
+        assertTrue(
+            texts.indexOf("Row 2: Region is South, Units is 95.") <
+                texts.indexOf("Row 1: Country is UK, Score is 88."),
+        )
+    }
+
+    @Test
+    fun `a single-column page is untouched by column detection`() {
+        val runs = paragraph(1, 100f, 72f, "One paragraph", "of ordinary single-column prose.")
+        val segments = cleaner.clean(runs)
+        assertEquals(1, segments.size)
+        assertEquals("One paragraph of ordinary single-column prose.", segments.first().text)
+    }
+
+    // -- Stage 2/3 heading guard --------------------------------------------------
+
+    @Test
+    fun `a lone superscript affiliation marker does not strand itself as a heading`() {
+        // The marker is raised above the affiliation text it labels, so it lands
+        // on its own line, one line above — and in a smaller face, which would
+        // otherwise satisfy the "short and off body-size" heading test on its own
+        // and strand it as a one-character utterance instead of letting it flow
+        // into the paragraph beneath it.
+        val runs = listOf(
+            run(1, 100f, 72f, "a", size = 7f, width = 4f),
+            run(1, 112f, 72f, "Department of Engineering,", width = 200f),
+            run(1, 124f, 72f, "Example University.", width = 200f),
+        )
+        val text = cleaner.cleanToText(runs)
+        assertEquals("a Department of Engineering, Example University.", text)
+    }
 }
